@@ -14,6 +14,18 @@
 [group('System')]
 benchmark:
     #!/usr/bin/env bash
+    source /usr/lib/ujust/ujust.sh
+    if ! type -P "stress-ng" &>/dev/null ; then
+        if gum confirm "Stress does not seem to be on your path, do you wish to install it?" ; then
+            set -eu
+            brew install stress-ng
+            brew link stress-ng
+            set +eu
+        else
+            exit 0
+        fi
+    fi
+
     echo 'Running a 1 minute benchmark ...'
     trap popd EXIT
     pushd $(mktemp -d)
@@ -22,7 +34,7 @@ benchmark:
 # Configure Bluefin-CLI Terminal Experience with Brew
 [group('System')]
 bluefin-cli:
-    @/usr/libexec/ublue-bling.sh
+    @/usr/libexec/ublue-bling
 
 # alias for toggle-devmode
 devmode:
@@ -35,11 +47,11 @@ toggle-devmode:
     source /usr/lib/ujust/ujust.sh
     CURRENT_IMAGE=$(rpm-ostree status -b --json | jq -r '.deployments[0]."container-image-reference"')
     if grep -q "/var/ublue-os/image" <<< $CURRENT_IMAGE ; then
-        cat <<EOF
+        bash -c "cat <<EOF
     Before we can switch to the Bluefin Developer Experience
     the current system needs an update. Please run 'ujust update'
     and reboot your system when the update is finished
-    EOF
+    EOF"
         exit
     fi
     if /bin/grep -q "\-dx" <<< $CURRENT_IMAGE ; then
@@ -70,6 +82,10 @@ toggle-devmode:
         NEW_IMAGE=$(sed "s/\-dx//" <<< $CURRENT_IMAGE)
         rpm-ostree rebase $NEW_IMAGE
     fi
+    if gum choose "Do you want to also install the default development flatpaks?" ; then
+        ujust install-system-flatpaks 1
+    fi
+
 
 # Ptyxis terminal transparency
 [group('System')]
@@ -92,7 +108,7 @@ ptyxis-transparency opacity="0.95":
 # Configure docker,incus-admin,lxd,libvirt container manager permissions
 [group('System')]
 dx-group:
-    #!/usr/bin/env bash
+    #!/usr/bin/pkexec bash
     append_group() {
         local group_name="$1"
         if ! grep -q "^$group_name:" /etc/group; then
@@ -101,14 +117,14 @@ dx-group:
         fi
     }
 
-    GROUPS_ADD=("docker" "incus-admin" "lxd" "libvirt")
+    GROUPS_ADD=("docker" "incus-admin" "libvirt")
 
     for GROUP_ADD in "${GROUPS_ADD[@]}" ; do
         append_group $GROUP_ADD
-        pkexec usermod -aG $GROUP_ADD $USER
+        usermod -aG $GROUP_ADD $USER
     done
 
-    echo "Reboot system and log back in to use docker, incus-admin, lxd, libvirt."
+    echo "Reboot system and log back in to use docker, libvirt and incus."
 
 # alias for configure-vfio
 [group('System')]
@@ -132,22 +148,22 @@ configure-vfio ACTION="":
     fi
     OPTION={{ ACTION }}
     if [ "$OPTION" == "help" ]; then
-        cat <<EOF
+        bash -c "cat <<EOF
     Usage: ujust configure-vfio <option>
       <option>: Specify the quick option to skip the prompt
       Use 'vfio-on' to select Enable VFIO drivers
       Use 'vfio-off' to select Disable VFIO drivers
-      Use 'kvmfr' to select Autocreate Looking-Glass shm
-    EOF
+      Use 'kvmfr' to enable kvmfr module for looking-glass
+    EOF"
         exit 0
     elif [ "$OPTION" == "" ]; then
-        cat <<EOF
+        bash -c "cat <<EOF
     ${bold}VFIO and kvmfr Configuration${normal}
     This is only used for GPU passthrough of a secondary dGPU.
-    It will enable vfio and configure kvmfr for use with $(Urllink "https://looking-glass.io" "Looking Glass")
+    It will enable vfio and configure kvmfr for use with $(Urllink "https://looking-glass.io" "Looking Glass").
     If you do not plan to use any of this then press ESC.
-    EOF
     ${bold}NOTE:${normal} Since this is a niche use case, support will be ${b}very limited${n}
+    EOF"
         OPTION=$(Choose \
           "Enable VFIO drivers" \
           "Disable VFIO drivers" \
@@ -156,32 +172,41 @@ configure-vfio ACTION="":
     fi
     if [[ "${OPTION,,}" =~ (^enable[[:space:]]vfio|vfio-on) ]]; then
         echo "Enabling VFIO..."
-        VIRT_TEST=$(rpm-ostree kargs)
         CPU_VENDOR=$(grep "vendor_id" "/proc/cpuinfo" | uniq | awk -F": " '{ print $2 }')
         VENDOR_KARG="unset"
-        if [[ ${VIRT_TEST} == *kvm.report_ignored_msrs* ]]; then
-            echo 'add_drivers+=" vfio vfio_iommu_type1 vfio-pci "' | sudo tee /etc/dracut.conf.d/vfio.conf
-            rpm-ostree initramfs --enable
-            if [[ ${CPU_VENDOR} == "AuthenticAMD" ]]; then
-                VENDOR_KARG="amd_iommu=on"
-            elif [[ ${CPU_VENDOR} == "GenuineIntel" ]]; then
-                VENDOR_KARG="intel_iommu=on"
+        if [[ ${CPU_VENDOR} == "AuthenticAMD" ]]; then
+            VENDOR_KARG="amd_iommu=on"
+        elif [[ ${CPU_VENDOR} == "GenuineIntel" ]]; then
+            VENDOR_KARG="intel_iommu=on"
+        fi
+        if [[ ${VENDOR_KARG} == "unset" ]]; then
+            echo "Failed to get CPU vendor, exiting..."
+            exit 1
+        else
+            rpm-ostree kargs \
+                --append-if-missing="${VENDOR_KARG}" \
+                --append-if-missing="iommu=pt" \
+                --append-if-missing="rd.driver.pre=vfio_pci" \
+                --append-if-missing="vfio_pci.disable_vga=1" \
+                --append-if-missing="kvm.ignore_msrs=1" \
+                --append-if-missing="kvm.report_ignored_msrs=0"
+            if sudo test ! -f "/etc/libvirt/hooks/qemu"; then
+                echo "Adding libvirt qemu hooks"
+                sudo wget 'https://raw.githubusercontent.com/PassthroughPOST/VFIO-Tools/master/libvirt_hooks/qemu' -O /etc/libvirt/hooks/qemu
+                sudo chmod +x /etc/libvirt/hooks/qemu
+                sudo grep -A1 -B1 "# Add" /etc/libvirt/hooks/qemu | sed 's/^# //g'
+                echo ""
+                if sudo test ! -d "/etc/libvirt/hooks/qemu.d"; then
+                    sudo mkdir /etc/libvirt/hooks/qemu.d
+                fi
             fi
-            if [[ ${VENDOR_KARG} == "unset" ]]; then
-                echo "Failed to get CPU vendor, exiting..."
-                exit 1
-            else
-                rpm-ostree kargs \
-                  --append-if-missing="${VENDOR_KARG}" \
-                  --append-if-missing="iommu=pt" \
-                  --append-if-missing="rd.driver.pre=vfio_pci" \
-                  --append-if-missing="vfio_pci.disable_vga=1"
-                echo "VFIO will be enabled on next boot, make sure you enable IOMMU, VT-d or AMD-v in your BIOS!"
-                echo "Please understand that since this is such a niche use case, support will be very limited!"
-                echo "To add your unused/second GPU device ids to the vfio driver by running"
-                echo 'rpm-ostree kargs --append-if-missing="vfio-pci.ids=xxxx:yyyy,xxxx:yyzz"'
-                echo "NOTE: Your second GPU will not be usable by the host after you do this!"
-            fi
+            echo "VFIO will be enabled on next boot, make sure you enable IOMMU, VT-d or AMD-v in your BIOS!"
+            echo "Please understand that since this is such a niche use case, support will be very limited!"
+            echo "To add your unused/second GPU device ids to the vfio driver by running"
+            echo 'rpm-ostree kargs --append-if-missing="vfio-pci.ids=xxxx:yyyy,xxxx:yyzz"'
+            echo 'you can find these using "ls-iommu -gr" or "ls-iommu -grr"'
+            echo 'for a dedicated gpu there will be at least 1 vga device and 1 audio device.'
+            echo "NOTE: The GPU you bound to vfio-pci will not be usable by the host after you do this!"
         fi
     elif [[ "${OPTION,,}" =~ (^disable[[:space:]]vfio|vfio-off) ]]; then
         echo ""
@@ -192,13 +217,10 @@ configure-vfio ACTION="":
             VFIO_IDS="$(rpm-ostree kargs | sed -E 's/.+(vfio_pci.ids=.+\s)/\1/' | awk '{ print $1 }' | grep vfio_pci.ids)"
             VFIO_IDS_KARG=""
             if [ -n "$VFIO_IDS" ]; then
-              echo "Found VFIO ids in kargs, adding the below line to removal list"
-              echo "$VFIO_IDS"
-              VFIO_IDS_KARG="--delete-if-present=\"$VFIO_IDS\""
+                echo "Found VFIO ids in kargs, adding the below line to removal list"
+                echo "$VFIO_IDS"
+                VFIO_IDS_KARG="--delete-if-present=\"$VFIO_IDS\""
             fi
-            echo "Removing dracut modules"
-            sudo rm /etc/dracut.conf.d/vfio.conf
-            rpm-ostree initramfs --enable
             rpm-ostree kargs \
                 --delete-if-present="iommu=pt" \
                 --delete-if-present="iommu=on" \
@@ -215,12 +237,30 @@ configure-vfio ACTION="":
 
 # Install system flatpaks for rebasers
 [group('System')]
-[private]
-install-system-flatpaks:
+install-system-flatpaks $dx="dynamic":
     #!/usr/bin/bash
-    FLATPAKS="bluefin_flatpaks/flatpaks"
-    FLATPAK_LIST="$(curl https://raw.githubusercontent.com/ublue-os/bluefin/main/${FLATPAKS} | tr '\n' ' ')"
-    flatpak --system -y install --or-update ${FLATPAK_LIST}
+    TARGET_FLATPAK_FILE="${TARGET_FLATPAK_FILE:-/etc/ublue-os/system-flatpaks.list}"
+    TARGET_DEVMODE_FILE="${TARGET_DEVMODE_FILE:-/etc/ublue-os/system-flatpaks-dx.list}"
+    case "$dx" in
+        "0"|"1")
+            ADD_DEVMODE="$dx"
+            ;;
+        "dynamic")
+            if [[ $(jq '."image-flavor"' /usr/share/ublue-os/image-info.json) =~ dx ]] ; then
+                ADD_DEVMODE=1
+            fi
+            ;;
+        *)
+            echo "Unsupported option"
+            exit 1
+            ;;
+    esac
+
+    flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
+    xargs flatpak --system -y install --or-update < $TARGET_FLATPAK_FILE
+    if [ "$ADD_DEVMODE" == "1" ] ; then
+        xargs flatpak --system -y install --or-update < $TARGET_DEVMODE_FILE
+    fi
 
 # Configure grub bootmenu visibility
 [group('System')]

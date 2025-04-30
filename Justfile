@@ -1,5 +1,5 @@
 repo_organization := "ublue-os"
-rechunker_image := "ghcr.io/hhd-dev/rechunk:v1.0.1"
+rechunker_image := "ghcr.io/hhd-dev/rechunk:v1.2.1"
 iso_builder_image := "ghcr.io/jasonn3/build-container-installer:v1.2.3"
 images := '(
     [bluefin]=bluefin
@@ -26,8 +26,9 @@ tags := '(
     [beta]=beta
 )'
 export SUDO_DISPLAY := if `if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then echo true; fi` == "true" { "true" } else { "false" }
-export SUDOIF := if `id -u` == "0" { "" } else { if SUDO_DISPLAY == "true" { "sudo --askpass" } else { "sudo" } }
-export PODMAN := if path_exists("/usr/bin/podman") == "true" { env("PODMAN", "/usr/bin/podman") } else { if path_exists("/usr/bin/docker") == "true" { env("PODMAN", "docker") } else { env("PODMAN", "exit 1 ; ") } }
+export SUDOIF := if `id -u` == "0" { "" } else if SUDO_DISPLAY == "true" { "sudo --askpass" } else { "sudo" }
+export PODMAN := if path_exists("/usr/bin/podman") == "true" { env("PODMAN", "/usr/bin/podman") } else if path_exists("/usr/bin/docker") == "true" { env("PODMAN", "docker") } else { env("PODMAN", "exit 1 ; ") }
+export PULL_POLICY := if PODMAN =~ "docker" { "missing" } else { "newer" }
 
 [private]
 default:
@@ -130,10 +131,10 @@ build $image="bluefin" $tag="latest" $flavor="main" rechunk="0" ghcr="0" pipelin
     # AKMODS Flavor and Kernel Version
     if [[ "${flavor}" =~ hwe ]]; then
         akmods_flavor="bazzite"
-    elif [[ "${tag}" =~ stable|gts ]]; then
+    elif [[ "${tag}" =~ gts|stable ]]; then
         akmods_flavor="coreos-stable"
     elif [[ "${tag}" =~ beta ]]; then
-        akmods_flavor="coreos-testing"
+        akmods_flavor="main"
     else
         akmods_flavor="main"
     fi
@@ -149,13 +150,12 @@ build $image="bluefin" $tag="latest" $flavor="main" rechunk="0" ghcr="0" pipelin
 
     # Kernel Release/Pin
     if [[ -z "${kernel_pin:-}" ]]; then
-        kernel_release=$(skopeo inspect --retry-times 3 docker://ghcr.io/ublue-os/${akmods_flavor}-kernel:"${fedora_version}" | jq -r '.Labels["ostree.linux"]')
+        kernel_release=$(skopeo inspect --retry-times 3 docker://ghcr.io/ublue-os/akmods:"${akmods_flavor}"-"${fedora_version}" | jq -r '.Labels["ostree.linux"]')
     else
         kernel_release="${kernel_pin}"
     fi
 
     # Verify Containers with Cosign
-    just verify-container "${akmods_flavor}-kernel:${kernel_release}"
     just verify-container "akmods:${akmods_flavor}-${fedora_version}-${kernel_release}"
     if [[ "${akmods_flavor}" =~ coreos ]]; then
         just verify-container "akmods-zfs:${akmods_flavor}-${fedora_version}-${kernel_release}"
@@ -192,6 +192,7 @@ build $image="bluefin" $tag="latest" $flavor="main" rechunk="0" ghcr="0" pipelin
     BUILD_ARGS+=("--build-arg" "IMAGE_NAME=${image_name}")
     BUILD_ARGS+=("--build-arg" "IMAGE_VENDOR={{ repo_organization }}")
     BUILD_ARGS+=("--build-arg" "KERNEL=${kernel_release}")
+    BUILD_ARGS+=("--build-arg" "VERSION=${ver}")
     if [[ -z "$(git status -s)" ]]; then
         BUILD_ARGS+=("--build-arg" "SHA_HEAD_SHORT=$(git rev-parse --short HEAD)")
     fi
@@ -213,7 +214,6 @@ build $image="bluefin" $tag="latest" $flavor="main" rechunk="0" ghcr="0" pipelin
     LABELS+=("--label" "org.opencontainers.image.source=https://raw.githubusercontent.com/ublue-os/bluefin/refs/heads/main/Containerfile")
     LABELS+=("--label" "org.opencontainers.image.url=https://projectbluefin.io")
     LABELS+=("--label" "org.opencontainers.image.vendor={{ repo_organization }}")
-    LABELS+=("--label" "io.artifacthub.package.category=bootc-images")
     LABELS+=("--label" "io.artifacthub.package.deprecated=false")
     LABELS+=("--label" "io.artifacthub.package.keywords=bootc,fedora,bluefin,ublue,universal-blue")
     LABELS+=("--label" "io.artifacthub.package.maintainers=[{\"name\": \"castrojo\", \"email\": \"jorge.castro@gmail.com\"}]")
@@ -226,7 +226,7 @@ build $image="bluefin" $tag="latest" $flavor="main" rechunk="0" ghcr="0" pipelin
         "${BUILD_ARGS[@]}" \
         "${LABELS[@]}" \
         --target "${target}" \
-        --tag "${image_name}:${tag}" \
+        --tag localhost/"${image_name}:${tag}" \
         --file Containerfile \
         .
     echo "::endgroup::"
@@ -310,7 +310,6 @@ rechunk $image="bluefin" $tag="latest" $flavor="main" ghcr="0" pipeline="0":
 
     # Rest of Labels
     LABELS="
-        io.artifacthub.package.category=bootc-images
         io.artifacthub.package.deprecated=false
         io.artifacthub.package.keywords=bootc,fedora,bluefin,ublue,universal-blue
         io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/120078124?s=200&v=4
@@ -346,7 +345,7 @@ rechunk $image="bluefin" $tag="latest" $flavor="main" ghcr="0" pipeline="0":
 
     # Run Rechunker's Prune
     ${SUDOIF} ${PODMAN} run --rm \
-        --pull=newer \
+        --pull=${PULL_POLICY} \
         --security-opt label=disable \
         --volume "$MOUNT":/var/tree \
         --env TREE=/var/tree \
@@ -379,7 +378,7 @@ rechunk $image="bluefin" $tag="latest" $flavor="main" ghcr="0" pipeline="0":
 
     # Run Rechunker
     ${SUDOIF} ${PODMAN} run --rm \
-        --pull=newer \
+        --pull=${PULL_POLICY} \
         --security-opt label=disable \
         --volume "$PWD:/workspace" \
         --volume "$PWD:/var/git" \
@@ -529,7 +528,8 @@ build-iso $image="bluefin" $tag="latest" $flavor="main" ghcr="0" pipeline="0":
     mkdir -p /var/tmp
     chmod -R 1777 /var/tmp
     flatpak config --system --set languages "*"
-    flatpak remote-add --system flathub https://flathub.org/repo/flathub.flatpakrepo
+    flatpak remote-delete --system fedora
+    flatpak remote-add --system --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
     flatpak install --system -y flathub ${flatpak_refs[@]}
     ostree refs --repo=\${FLATPAK_SYSTEM_DIR}/repo | grep '^deploy/' | grep -v 'org\.freedesktop\.Platform\.openh264' | sed 's/^deploy\///g' > /output/flatpaks-with-deps
     EOF
@@ -559,11 +559,14 @@ build-iso $image="bluefin" $tag="latest" $flavor="main" ghcr="0" pipeline="0":
 
     # Build ISO
     iso_build_args=()
-    iso_build_args+=("--rm" "--privileged" "--pull=newer")
+    iso_build_args+=("--rm" "--privileged" "--pull=${PULL_POLICY}")
     if [[ "{{ ghcr }}" == "0" ]]; then
-    	iso_build_args+=(--volume "/var/lib/containers/storage:/var/lib/containers/storage")
+    	iso_build_args+=(
+            "--security-opt=label=disable"
+            "--volume=/var/lib/containers/storage:/var/lib/containers/storage"
+        )
     fi
-    iso_build_args+=(--volume "${PWD}:/github/workspace/")
+    iso_build_args+=("--volume=${PWD}:/github/workspace/")
     iso_build_args+=("{{ iso_builder_image }}")
     iso_build_args+=(ARCH="x86_64")
     iso_build_args+=(ENROLLMENT_PASSWORD="universalblue")
@@ -620,7 +623,7 @@ run-iso $image="bluefin" $tag="latest" $flavor="main":
     echo "Connect to http://localhost:${port}"
     run_args=()
     run_args+=(--rm --privileged)
-    run_args+=(--pull=newer)
+    run_args+=(--pull=${PULL_POLICY})
     run_args+=(--publish "127.0.0.1:${port}:8006")
     run_args+=(--env "CPU_CORES=4")
     run_args+=(--env "RAM_SIZE=8G")
@@ -631,9 +634,8 @@ run-iso $image="bluefin" $tag="latest" $flavor="main":
     run_args+=(--device=/dev/kvm)
     run_args+=(--volume "${PWD}/${image_name}_build/${image_name}-${tag}.iso":"/boot.iso")
     run_args+=(docker.io/qemux/qemu-docker)
-    ${PODMAN} run "${run_args[@]}" &
-    xdg-open http://localhost:${port}
-    fg "%podman" || fg "%docker"
+    xdg-open http://localhost:${port} &
+    ${PODMAN} run "${run_args[@]}"
 
 # Test Changelogs
 [group('Changelogs')]
@@ -694,8 +696,8 @@ secureboot $image="bluefin" $tag="latest" $flavor="main":
     ${PODMAN} rm "$TMP"
 
     # Get the Public Certificates
-    curl --retry 3 -Lo /tmp/kernel-sign.der https://github.com/ublue-os/kernel-cache/raw/main/certs/public_key.der
-    curl --retry 3 -Lo /tmp/akmods.der https://github.com/ublue-os/kernel-cache/raw/main/certs/public_key_2.der
+    curl --retry 3 -Lo /tmp/kernel-sign.der https://github.com/ublue-os/akmods/raw/main/certs/public_key.der
+    curl --retry 3 -Lo /tmp/akmods.der https://github.com/ublue-os/akmods/raw/main/certs/public_key_2.der
     openssl x509 -in /tmp/kernel-sign.der -out /tmp/kernel-sign.crt
     openssl x509 -in /tmp/akmods.der -out /tmp/akmods.crt
 
@@ -867,3 +869,28 @@ tag-images image_name="" default_tag="" tags="":
 
     # Show Images
     ${PODMAN} images
+
+# Examples:
+#   > just retag-nvidia-on-ghcr stable-daily stable-daily-41.20250126.3 0
+#   > just retag-nvidia-on-ghcr latest latest-41.20250228.1 0
+#
+# working_tag: The tag of the most recent known good image (e.g., stable-daily-41.20250126.3)
+# stream:      One of latest, stable-daily, stable or gts
+# dry_run:     Only print the skopeo commands instead of running them
+#
+# First generate a PAT with package write access (https://github.com/settings/tokens)
+# and set $GITHUB_USERNAME and $GITHUB_PAT environment variables
+
+# Retag images on GHCR
+[group('Admin')]
+retag-nvidia-on-ghcr working_tag="" stream="" dry_run="1":
+    #!/bin/bash
+    set -euxo pipefail
+    skopeo="echo === skopeo"
+    if [[ "{{ dry_run }}" -ne 1 ]]; then
+        echo "$GITHUB_PAT" | podman login -u $GITHUB_USERNAME --password-stdin ghcr.io
+        skopeo="skopeo"
+    fi
+    for image in bluefin-nvidia-open bluefin-nvidia bluefin-dx-nvidia bluefin-dx-nvidia-open; do
+      $skopeo copy docker://ghcr.io/ublue-os/${image}:{{ working_tag }} docker://ghcr.io/ublue-os/${image}:{{ stream }}
+    done
